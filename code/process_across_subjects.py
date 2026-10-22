@@ -5,33 +5,39 @@ from Preprocessing import Preprocessing
 from datetime import date
 def process_across_subjects(data_directory,output_directory, x_cord_column,y_cord_column, rt_column="",
                             response_column = "", columns_to_preserve = [],
-                            practice_mode='auto', num_practice_trials=0, num_trials=None):
+                            practice_mode='auto', num_practice_trials=0, num_trials=None,
+                            time_column="", output_name=None, practice_marker="ready to begin the task"):
     """
     This function receives a directory and apply the functions in the above class to all the subjects files in the directory.
     It also creates a unified CSV file of all subjects and saves it in the output directory.
-    Practice trials can be removed automatically via the 'test_part' column or manually via the
-    `num_practice_trials`/`num_trials` parameters.
+    Practice trials can be removed automatically via the 'test_part' column, manually via the
+    `num_practice_trials`/`num_trials` parameters, or via the screen that marks the start of the task.
     :Param data_directory: directory of the data files.
     :Param x_cord_column: column name containing x-coordinates
     :Param y_cord_column: column name containing y-coordinates
     :Param response_column: optional column name containing response data
     :Param columns_to_preserve: list, column names to check for preserving rows without trajectory data
-    :Param practice_mode: str, 'auto' or 'manual' (default 'auto')
+    :Param practice_mode: str, 'auto', 'manual' or 'marker' (default 'auto')
     :Param num_practice_trials: int, number of practice trials to drop when using manual mode
     :Param num_trials: int | None, number of experimental trials to keep when using manual mode
+    :Param time_column: optional column name containing the timestamp of every sample (time-based velocity)
+    :Param output_name: optional name of the output file (without .csv). Default: all_subjects_processed<DATE>
+    :Param practice_marker: str, text of the screen that starts the real task (marker mode only)
+    :Return: path of the saved output file
     """
     df_list = []
-    files = os.listdir(data_directory)
+    files = sorted(os.listdir(data_directory))  # fixed order, so subject_id is the same on every machine
     x_list = []
     y_list = []
     v_list = []
     a_list = []
+    tv_list = []
 
     sub_counter = 1
     for sub in range(len(files)):
-        if (files[sub][0:3] != 'all' and 
-            files[sub] != '.DS_Store' and 
-            files[sub] != '.gitkeep' and 
+        if (files[sub][0:3] != 'all' and
+            files[sub] != '.DS_Store' and
+            files[sub] != '.gitkeep' and
             files[sub].endswith('.csv')):
             print("currently processing ", "subject :",files[sub] )
             cur_class = Preprocessing(
@@ -43,12 +49,15 @@ def process_across_subjects(data_directory,output_directory, x_cord_column,y_cor
                 columns_to_preserve,
                 practice_mode,
                 num_practice_trials,
-                num_trials
+                num_trials,
+                time_column,
+                practice_marker
             )
             # preprocess
             if cur_class.isOK:
                 cur_class.normalize_time_points()
                 cur_class.rescale()
+            if cur_class.isOK:  # rescale() marks subjects that cannot be rescaled
                 cur_class.remap_trajectories()
             cur_class.calculate_all_measures()
             df_list.append(cur_class.df)
@@ -60,6 +69,7 @@ def process_across_subjects(data_directory,output_directory, x_cord_column,y_cor
             v_full, a_full = cur_class.get_kinematics_arrays()
             v_list.append(v_full)
             a_list.append(a_full)
+            tv_list.append(cur_class.get_time_kinematics_arrays())
 
             cur_class.df['subject_id'] = sub_counter
             sub_counter += 1
@@ -68,13 +78,19 @@ def process_across_subjects(data_directory,output_directory, x_cord_column,y_cor
     big_y = np.concatenate(y_list, axis=1)
     big_v = np.concatenate(v_list, axis=1)
     big_a = np.concatenate(a_list, axis=1)
+    big_tv = np.concatenate(tv_list, axis=1)
 
     big_x = pd.DataFrame(np.transpose(big_x)).add_prefix('x_')
     big_y = pd.DataFrame(np.transpose(big_y)).add_prefix('y_')
     big_v = pd.DataFrame(np.transpose(big_v)).add_prefix('v_')
     big_a = pd.DataFrame(np.transpose(big_a)).add_prefix('a_')
+    big_tv = pd.DataFrame(np.transpose(big_tv)).add_prefix('tv_')
 
     big_df = big_df.reset_index(drop=True)
-    big_df = pd.concat([big_df, big_x, big_y, big_v, big_a], axis=1)
+    big_df = pd.concat([big_df, big_x, big_y, big_v, big_a, big_tv], axis=1)
 
-    big_df.to_csv(output_directory+os.sep+'all_subjects_processed'+str(date.today())+'.csv')
+    if output_name is None:
+        output_name = 'all_subjects_processed'+str(date.today())
+    output_path = output_directory+os.sep+output_name+'.csv'
+    big_df.to_csv(output_path)
+    return output_path

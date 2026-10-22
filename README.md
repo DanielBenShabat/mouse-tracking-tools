@@ -32,6 +32,21 @@ This class contains all preprocessing-related functions for mouse tracking data,
 5. initiation angle: the angle between the starting of the trajectory to the x-axis
 6. initiation correspondence: determines whether the initiation angle is below 90, i.e., whether it corresponds to the direction of the chosen option.
 
+It also extracts kinematic measures. `mean_velocity`, `max_velocity`, `mean_acceleration` and the profiles `v_0..v_100` / `a_0..a_100` assume that the 101 points are equally spaced in time (RT / 100), so `mean_velocity` equals trajectory length / RT.
+
+When a timestamp column is given (`TIME_COLUMN`, e.g. `time_cord`), velocity is also calculated from the real timestamps of the samples. Each trial is resampled every 10 ms in real time, and velocity is calculated with a Savitzky-Golay filter over 50 ms. The browser sometimes records two samples only 1-4 ms apart, and without smoothing this timing jitter shows up as velocity spikes. All measures are in the rescaled space (velocity in units/s, acceleration in units/s², times in ms). A trial is "moving" while its speed is at least 5% of its peak speed.
+- `tv_0..tv_100`: velocity profile over real time, at 101 points equally spaced from the first to the last recorded sample.
+- `velocity_peak`: peak velocity.
+- `velocity_time_to_peak`: time from movement onset to peak velocity.
+- `velocity_peak_relative`: when the peak happens within the movement, from 0 (at onset) to 1 (at the end). Values around 0.5 mean a symmetric, bell-shaped profile.
+- `velocity_num_peaks`: number of velocity peaks (prominence of at least 10% of the peak). 1 means a single smooth movement, more means corrections or sub-movements.
+- `idle_time`: time the mouse stood still between movement onset and the end of the movement.
+- `initiation_time`: time from the start of the trial until the movement started. Recording starts when the mouse first moves, so this is RT minus the recorded duration, plus the time until the speed crossed the threshold.
+- `recorded_duration`: time from the first to the last recorded sample.
+- `peak_acceleration` / `peak_deceleration`: maximal acceleration and maximal deceleration (both positive).
+
+Subjects who only ever chose one side cannot be rescaled. They are marked with `is_OK = False`, a warning is printed, and their measures are left empty.
+
 #### process_across_subjects.py
 
 This function runs preprocessing iteratively over all data files in the data folder and outputs a unified data file with all mouse measures calculated.
@@ -70,7 +85,7 @@ Use this file as the “control panel” for the entire toolkit. You do not need
    NUM_TRIALS = 66           # number of experimental trajectories to keep
    ```
    - In manual mode, set both `NUM_PRACTICE_TRIALS` and `NUM_TRIALS` to match your task.
-   - Any row whose `trial_num` is below zero is removed automatically, so you do not have to clean those yourself.
+   - A third mode, `'marker'`, removes everything up to and including the "You are now ready to begin the task." screen. It works even when the practice trials are labelled like the real ones. In this mode, each slider response is attached to the trial right before it.
 
 4. **Customize the plots (optional)**  
    Update the visualization settings (titles, colors, fonts, subject to inspect). These only affect the charts saved to the `output/` folder.
@@ -86,6 +101,14 @@ Use this file as the “control panel” for the entire toolkit. You do not need
    ```
    - The processed dataset is saved to `output/all_subjects_processed<DATE>.csv`.
    - Plots such as “Average trajectories” and “Subject X trajectories” are also saved there.
+
+#### run_experiments.py
+
+Runs the preprocessing on many experiments at once. Each experiment is a folder that contains `data/<zip file>` with one CSV per participant:
+```bash
+python code/run_experiments.py <experiments folder> [--output <output folder>] [--only bltr_confidence sntr_3blcks]
+```
+Each experiment is saved as `<experiment name>.csv`, in an `output` folder next to the experiments folder by default. The settings for all experiments are in `DEFAULT_SETTINGS`, and experiments that differ get overrides in `EXPERIMENT_SETTINGS`.
 
 If something fails, double-check that the column names match exactly, that your CSV files contain mouse coordinates, and that the required Python packages from `requirements.txt` are installed.
 

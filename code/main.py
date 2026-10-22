@@ -20,6 +20,7 @@ NUM_TRIALS = 66            # Only used when PRACTICE_MODE == 'manual'. 0 = keep 
 X_CORD_COLUMN = 'x_cord'  # The name of the column of x coordinates
 Y_CORD_COLUMN = 'y_cord'  # The name of the column of y coordinates
 RT_COLUMN = 'rt'  # Optional, name of the column with reaction time data. If not provided, RT will not be included in the output file.
+TIME_COLUMN = 'time_cord'  # Optional, name of the column with the timestamp of every sample. Needed for the time-based velocity measures.
 FIRST_CONDITION_COLUMN = 'trajectory'  # Optional, name of the column describe the experimental factor
 SECOND_CONDITION_COLUMN = ''  # Optional, name of the column describe an experimental condition of second order
 RESPONSE_COLUMN = '' #optional, name of the column with the difficulty slider
@@ -75,7 +76,7 @@ if __name__ == "__main__":
         process_across_subjects(data_directory, output_directory,
                                 X_CORD_COLUMN, Y_CORD_COLUMN, RT_COLUMN,
                                 RESPONSE_COLUMN, COLUMNS_TO_PRESERVE,
-                                PRACTICE_MODE, NUM_PRACTICE_TRIALS, NUM_TRIALS)
+                                PRACTICE_MODE, NUM_PRACTICE_TRIALS, NUM_TRIALS, TIME_COLUMN)
 
     if ALTERNATIVE_VIS_PATH:
         vis_path = ALTERNATIVE_VIS_PATH

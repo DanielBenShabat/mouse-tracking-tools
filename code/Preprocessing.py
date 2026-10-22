@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import interpolate
+from scipy.signal import find_peaks, savgol_filter
 import math
 
 
@@ -21,36 +22,59 @@ class Preprocessing(object):
         Column that stores additional slider/response data to keep.
     columns_to_preserve : list[str], optional
         Columns that should be preserved even when the row has no trajectory data.
-    practice_mode : {'auto', 'manual'}
+    practice_mode : {'auto', 'manual', 'marker'}
         - 'auto'   → drop practice trials using the `test_part` column (default behaviour)
         - 'manual' → drop practice trials using NUM_PRACTICE_TRIALS/NUM_TRIALS settings
+        - 'marker' → drop every row up to and including the screen whose `stimulus` contains `practice_marker`
     num_practice_trials : int
         Number of leading trajectory rows that should be discarded (manual mode only).
     num_trials : int | None
         Number of experimental trajectory rows to keep after discarding practice rows (manual mode only).
+    time_column : str, optional
+        Column that stores the serialized timestamp (ms) of every x/y sample.
+        Needed for the time-based velocity measures.
+    practice_marker : str
+        Text of the screen that separates practice from the real task (marker mode only).
     """
     normalized_x = 1
     normalized_y = 1.5
+    # a trial is "moving" while its speed is at least this fraction of its peak speed
+    MOVEMENT_THRESHOLD = 0.05
+    # a velocity peak is counted if its prominence is at least this fraction of the trial's peak speed
+    PEAK_PROMINENCE = 0.1
+    # time-based velocity: samples are resampled every SAMPLE_STEP_MS and smoothed over SMOOTHING_WINDOW points (50 ms)
+    SAMPLE_STEP_MS = 10
+    SMOOTHING_WINDOW = 5
+    TIME_MEASURES = ['recorded_duration', 'initiation_time', 'velocity_peak', 'velocity_time_to_peak',
+                     'velocity_peak_relative', 'velocity_num_peaks', 'idle_time', 'peak_acceleration', 'peak_deceleration']
     def __init__(self,path,x_cord_column,y_cord_column, rt_column = "", response_column = "", columns_to_preserve = [],
-                 practice_mode='auto', num_practice_trials=0, num_trials=None):
+                 practice_mode='auto', num_practice_trials=0, num_trials=None,
+                 time_column = "", practice_marker = "ready to begin the task"):
         self.isOK = True
         self.normalized_x = 1
         self.normalized_y = 1.5
         self.max_length = 0
         self.NUM_TIMEPOINTS = 101
+        self.path = path
         self.x_cord_column = x_cord_column
         self.y_cord_column = y_cord_column
         self.rt_column = rt_column
         self.practice_mode = practice_mode.lower() if isinstance(practice_mode, str) else 'auto'
-        if self.practice_mode not in ('auto', 'manual'):
+        if self.practice_mode not in ('auto', 'manual', 'marker'):
             self.practice_mode = 'auto'
         self.num_practice_trials = max(0, num_practice_trials or 0)
         self.num_trials = num_trials if num_trials and num_trials > 0 else None
+        self.practice_marker = practice_marker
         csv = pd.read_csv (path,index_col=None, header=0)
         #csv = self._drop_invalid_trials(csv)
         original_csv = csv.copy()  # Keep original for add_slider_data method
 
         csv = self._filter_practice_trials(csv).reset_index(drop=True)
+
+        # In marker mode every response is attached to the trial right before it,
+        # so a missing trial or response cannot shift the remaining responses.
+        if self.practice_mode == 'marker' and response_column != "":
+            csv['explicit_slider'] = self._pair_responses_with_trials(csv, response_column)
 
 
         # Smart filtering: keep rows with trajectory data OR rows with data in columns_to_preserve
@@ -69,7 +93,7 @@ class Preprocessing(object):
         # Track which rows have trajectory data vs non-trajectory data
         self.trajectory_rows = self.df[x_cord_column].notna().values
         self.num_trajectory_rows = self.trajectory_rows.sum()
-        if response_column != "": #  if there is response
+        if response_column != "" and self.practice_mode != 'marker': #  if there is response
             self.df['explicit_slider'] = self.add_slider_data(original_csv,response_column)
         
         # Only process x/y coordinates for rows that have trajectory data
@@ -88,13 +112,26 @@ class Preprocessing(object):
         self.y = self.y.astype(np.float64)
         self.y = np.transpose(self.y)
 
+        # Keep the raw samples (with their timestamps) for the time-based velocity measures,
+        # since normalize_time_points() replaces self.x/self.y with 101 index-based points.
+        self.x_raw = self.x.copy()
+        self.y_raw = self.y.copy()
+        self.t_raw = None
+        if time_column != "" and time_column in self.df.columns:
+            t = trajectory_df[time_column].astype(str).str.split(',', expand=True)
+            self.t_raw = np.transpose(t.reset_index(drop=True).replace({'': np.nan, 'nan': np.nan}).to_numpy().astype(np.float64))
+
     def _filter_practice_trials(self, csv):
         """
-        Drop practice trials either automatically via the 'test_part' column
-        or manually via the NUM_PRACTICE_TRIALS/NUM_TRIALS settings.
+        Drop practice trials automatically via the 'test_part' column,
+        manually via the NUM_PRACTICE_TRIALS/NUM_TRIALS settings,
+        or via the screen that marks the start of the real task.
         """
         if self.practice_mode == 'manual':
             return self._drop_manual_practice_trials(csv)
+
+        if self.practice_mode == 'marker':
+            return self._drop_trials_before_marker(csv)
 
         if 'test_part' not in csv.columns:
             return csv
@@ -129,6 +166,43 @@ class Preprocessing(object):
             csv = csv.drop(index=excess_indices)
 
         return csv
+
+    def _drop_trials_before_marker(self, csv):
+        """
+        Remove every row up to and including the first screen whose `stimulus` contains the practice marker.
+        If the marker is missing, nothing is removed and a warning is printed.
+        """
+        if 'stimulus' not in csv.columns:
+            print("WARNING: no 'stimulus' column, practice trials were not removed in", self.path)
+            return csv
+        marker_rows = csv.index[csv['stimulus'].astype(str).str.contains(self.practice_marker, case=False, regex=False)]
+        if len(marker_rows) == 0:
+            print("WARNING: practice marker not found, practice trials were not removed in", self.path)
+            return csv
+        return csv.loc[marker_rows[0] + 1:]
+
+    def _pair_responses_with_trials(self, csv, response_column):
+        """
+        Return a column aligned with `csv` in which each trajectory row gets the first response
+        that follows it (before the next trajectory row), divided by 100 as in add_slider_data.
+        Only slider rows are used, so other responses (e.g. button presses) are never paired.
+        """
+        paired = np.full(csv.shape[0], np.nan)
+        if response_column not in csv.columns:
+            return paired
+        responses = pd.to_numeric(csv[response_column], errors='coerce')
+        if 'trial_type' in csv.columns:
+            responses = responses.where(csv['trial_type'].astype(str).str.contains('slider', case=False))
+        responses = responses.to_numpy()
+        has_trajectory = csv[self.x_cord_column].notna().to_numpy()
+        current_trial = None
+        for i in range(csv.shape[0]):
+            if has_trajectory[i]:
+                current_trial = i
+            elif current_trial is not None and not np.isnan(responses[i]):
+                paired[current_trial] = responses[i] / 100
+                current_trial = None
+        return paired
 
     def get_coordinate_arrays(self):
         """
@@ -200,9 +274,18 @@ class Preprocessing(object):
         default and recommended is - [1,1.5] and [-1,1.5] respectively
         """
 
+        if self.num_trajectory_rows == 0:
+            print("WARNING: subject has no trials, marked as is_OK=False:", self.path)
+            self.isOK = False
+            return
         self.continue_x = np.mean(self.x[0,:])#calculating the x cordinates for the continue button
         left_subset = self.x[:,self.x[self.NUM_TIMEPOINTS-1,:]<self.continue_x] #subsetting all trials where the left option is chosen
         right_subset = self.x[:,self.x[self.NUM_TIMEPOINTS-1,:]>self.continue_x]
+        if left_subset.shape[1] == 0 or right_subset.shape[1] == 0:
+            # the target positions cannot be estimated without choices on both sides
+            print("WARNING: subject never chose one of the sides, marked as is_OK=False:", self.path)
+            self.isOK = False
+            return
         self.right_x, self.left_x = np.mean(right_subset[-1,:]),np.mean(left_subset[-1,:])#calculating the x cordinates for the choices
         self.x -= self.continue_x #center x coordinates
         self.x  = (self.x / ((self.right_x-self.left_x)/2))*self.normalized_x #rescale x coordinates
@@ -391,6 +474,107 @@ class Preprocessing(object):
             padded_acc[2:] = accelerations
             self.accelerations_full.append(padded_acc)
 
+    def get_time_kinematics(self):
+        """
+        This function calculates velocity measures from the real sample timestamps (time_column).
+        Each trial is resampled every SAMPLE_STEP_MS in real time and velocity is calculated with a
+        Savitzky-Golay filter. The velocity profile is then stored as NUM_TIMEPOINTS equally spaced points
+        in real time. Positions are in the rescaled space, velocity is in units/s,
+        acceleration in units/s^2 and times in ms.
+        IMPORTANT: this function will only work if you apply the rescale function first.
+        """
+        names = self.TIME_MEASURES
+        self.time_measures = {name: [] for name in names}
+        self.time_velocities_full = []
+
+        has_rt = self.rt_column != "" and self.rt_column in self.df.columns
+        trajectory_indices = np.where(self.trajectory_rows)[0]
+
+        for trial in range(self.num_trajectory_rows):
+            values = self._time_kinematics_of_trial(trial, trajectory_indices[trial], has_rt)
+            if values is None:
+                for name in names:
+                    self.time_measures[name].append(np.nan)
+                self.time_velocities_full.append(np.full(self.NUM_TIMEPOINTS, np.nan))
+                continue
+            measures, velocities = values
+            for name in names:
+                self.time_measures[name].append(measures[name])
+            self.time_velocities_full.append(velocities)
+
+    def _time_kinematics_of_trial(self, trial, original_row_idx, has_rt):
+        """
+        Returns (measures dict, velocity profile) for one trial, or None if the timestamps are unusable.
+        """
+        if self.t_raw is None:
+            return None
+        t = self.t_raw[:, trial]
+        x = self.x_raw[:, trial]
+        y = self.y_raw[:, trial]
+        t, x, y = t[~np.isnan(t)], x[~np.isnan(x)], y[~np.isnan(y)]
+        # every sample needs its own timestamp
+        if len(t) != len(x) or len(x) != len(y) or len(x) < 2:
+            return None
+        if np.any(np.diff(t) < 0) or t[-1] <= t[0]:
+            return None
+
+        # same linear transform as rescale(); remapping does not change speed
+        x = ((x - self.continue_x) / ((self.right_x - self.left_x) / 2)) * self.normalized_x
+        y = (-(y - self.continue_y) / (self.continue_y - self.targets_y)) * self.normalized_y
+
+        # Resample to a fixed time step and differentiate with a Savitzky-Golay filter: the browser sometimes
+        # records two samples 1-4 ms apart, and plain differences turn that timing jitter into velocity spikes.
+        t = t - t[0]
+        grid = np.arange(0, t[-1] + 1e-9, self.SAMPLE_STEP_MS)
+        if len(grid) < 3:
+            return None
+        window = min(self.SMOOTHING_WINDOW, len(grid) if len(grid) % 2 == 1 else len(grid) - 1)
+        x_grid = np.interp(grid, t, x)
+        y_grid = np.interp(grid, t, y)
+        vx = savgol_filter(x_grid, window, 2, deriv=1, delta=self.SAMPLE_STEP_MS)
+        vy = savgol_filter(y_grid, window, 2, deriv=1, delta=self.SAMPLE_STEP_MS)
+        velocities = np.hypot(vx, vy) * 1000  # units/ms -> units/s
+        accelerations = savgol_filter(velocities, window, 2, deriv=1, delta=self.SAMPLE_STEP_MS) * 1000
+        peak = np.max(velocities)
+        if not np.isfinite(peak) or peak <= 0:
+            return None
+
+        moving = np.where(velocities >= self.MOVEMENT_THRESHOLD * peak)[0]
+        onset, offset = moving[0], moving[-1]
+        peak_idx = int(np.argmax(velocities))
+        step = grid[1] - grid[0]
+        idle_points = np.count_nonzero(velocities[onset:offset + 1] < self.MOVEMENT_THRESHOLD * peak)
+
+        # time between the start of the trial and the first recorded sample (recording starts when the mouse moves)
+        pre_recording = np.nan
+        if has_rt:
+            rt_val = self.df.loc[original_row_idx, self.rt_column]
+            if not pd.isna(rt_val) and float(rt_val) >= t[-1]:
+                pre_recording = float(rt_val) - t[-1]
+
+        measures = {
+            'recorded_duration': t[-1],
+            'initiation_time': pre_recording + grid[onset],
+            'velocity_peak': peak,
+            'velocity_time_to_peak': grid[peak_idx] - grid[onset],
+            'velocity_peak_relative': (grid[peak_idx] - grid[onset]) / (grid[offset] - grid[onset]) if offset > onset else np.nan,
+            'velocity_num_peaks': len(find_peaks(velocities, prominence=self.PEAK_PROMINENCE * peak)[0]),
+            'idle_time': idle_points * step,
+            'peak_acceleration': np.max(accelerations),
+            'peak_deceleration': -np.min(accelerations),
+        }
+        # profile of NUM_TIMEPOINTS points, equally spaced in real time from the first to the last sample
+        profile = np.interp(np.linspace(0, grid[-1], self.NUM_TIMEPOINTS), grid, velocities)
+        return measures, profile
+
+    def get_time_kinematics_arrays(self):
+        tv_full = np.full([self.NUM_TIMEPOINTS, self.df.shape[0]], np.nan)
+        if self.isOK and hasattr(self, 'time_velocities_full') and len(self.time_velocities_full) > 0:
+            trajectory_indices = np.where(self.trajectory_rows)[0]
+            if len(trajectory_indices) > 0:
+                tv_full[:, trajectory_indices] = np.array(self.time_velocities_full).T
+        return tv_full
+
     def get_kinematics_arrays(self):
         v_full = np.full([self.NUM_TIMEPOINTS, self.df.shape[0]], np.nan)
         a_full = np.full([self.NUM_TIMEPOINTS, self.df.shape[0]], np.nan)
@@ -433,7 +617,8 @@ class Preprocessing(object):
             self.get_initiation_angle()
             self.measure_trajectory_length()
             self.get_kinematics()
-            
+            self.get_time_kinematics()
+
             # Calculate the real minimum trajectory length for each trajectory trial
             real_min_lengths = []
             for i in range(self.num_trajectory_rows):
@@ -484,6 +669,11 @@ class Preprocessing(object):
             self.df['max_velocity'] = max_vel_all
             self.df['mean_acceleration'] = mean_accel_all
 
+            for name, values in self.time_measures.items():
+                column = np.full(self.df.shape[0], np.nan)
+                column[trajectory_indices] = values
+                self.df[name] = column
+
         else:  # if data is not ok, fill all columns with nan
             self.df['flips'] = (np.full([self.df.shape[0]],np.nan))
             self.df['max_deviation'] = (np.full([self.df.shape[0]],np.nan))
@@ -496,6 +686,8 @@ class Preprocessing(object):
             self.df['mean_velocity'] = np.full([self.df.shape[0]], np.nan)
             self.df['max_velocity'] = np.full([self.df.shape[0]], np.nan)
             self.df['mean_acceleration'] = np.full([self.df.shape[0]], np.nan)
+            for name in self.TIME_MEASURES:
+                self.df[name] = np.full([self.df.shape[0]], np.nan)
 
 # exmp = Preprocessing(r'C:\Users\mhavi\shalevproject\mouse-tracking-tools-master\data\5a0c4184fe645f0001e9f5dd.csv',3,120,"x_cord","y_cord")
 # exmp.normalize_time_points()
